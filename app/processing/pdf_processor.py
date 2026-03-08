@@ -1,12 +1,12 @@
 """
 PDF and document text extraction pipeline.
-Supports both text-layer extraction (PyPDF) and multimodal OCR fallback.
+Supports both text-layer extraction (PyPDF) and multimodal OCR fallback
+using Azure OpenAI Vision API.
 """
 
 import base64
 import io
 import logging
-import os
 from pathlib import Path
 from typing import Optional
 
@@ -17,16 +17,37 @@ class PDFProcessor:
     """
     Hybrid PDF processor:
     1. Attempts text-layer extraction with PyPDF
-    2. Falls back to multimodal OCR if text is insufficient
+    2. Falls back to multimodal OCR via Azure OpenAI Vision if text is insufficient
     """
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, azure: dict):
+        """
+        Args:
+            api_key: Azure OpenAI API key
+            azure:   Dict with keys: base_url, deployment, api_version
+                     (as returned by parse_azure_uri in dspy_agent.py)
+        """
         self.api_key = api_key
-        os.environ["OPENAI_API_KEY"] = api_key
+        self.azure_endpoint = azure["base_url"]
+        self.deployment = azure["deployment"]
+        self.api_version = azure["api_version"]
+
+    def _get_azure_client(self):
+        """Create an AzureOpenAI client."""
+        from openai import AzureOpenAI
+        return AzureOpenAI(
+            api_key=self.api_key,
+            azure_endpoint=self.azure_endpoint,
+            api_version=self.api_version,
+        )
+
+    # ─────────────────────────────────────────────
+    # Primary text extraction
+    # ─────────────────────────────────────────────
 
     def extract_text(self, file_path: str) -> str:
         """
-        Primary extraction: attempt PyPDF text-layer extraction.
+        Primary extraction: attempt text-layer extraction based on file type.
         Returns extracted text or empty string if failed.
         """
         file_path = Path(file_path)
@@ -52,7 +73,7 @@ class PDFProcessor:
                 logger.info(f"PDF has {len(reader.pages)} pages")
                 for i, page in enumerate(reader.pages):
                     page_text = page.extract_text() or ""
-                    text_parts.append(f"--- Page {i+1} ---\n{page_text}")
+                    text_parts.append(f"--- Page {i + 1} ---\n{page_text}")
             full_text = "\n".join(text_parts)
             logger.info(f"PyPDF extracted {len(full_text)} characters")
             return full_text
@@ -67,7 +88,6 @@ class PDFProcessor:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 html = f.read()
             soup = BeautifulSoup(html, "html.parser")
-            # Remove script and style elements
             for tag in soup(["script", "style", "nav", "footer", "header"]):
                 tag.decompose()
             text = soup.get_text(separator="\n", strip=True)
@@ -77,16 +97,21 @@ class PDFProcessor:
             logger.error(f"HTML extraction failed: {e}")
             return ""
 
+    # ─────────────────────────────────────────────
+    # OCR fallback
+    # ─────────────────────────────────────────────
+
     def ocr_extract(self, file_path: str) -> str:
         """
-        OCR fallback: Convert PDF pages to images and use multimodal LLM.
+        OCR fallback: convert PDF pages to images and send to
+        Azure OpenAI Vision API for text extraction.
         """
         file_path = Path(file_path)
         if file_path.suffix.lower() != ".pdf":
             logger.warning(f"OCR only supports PDFs, got: {file_path.suffix}")
             return self.extract_text(str(file_path))
 
-        self._log_ocr_start(file_path)
+        logger.info(f"Starting OCR pipeline for: {file_path.name}")
 
         try:
             images = self._convert_pdf_to_images(str(file_path))
@@ -96,9 +121,9 @@ class PDFProcessor:
 
             all_text = []
             for i, image_data in enumerate(images):
-                logger.info(f"OCR processing page {i+1}/{len(images)}")
+                logger.info(f"OCR processing page {i + 1}/{len(images)}")
                 page_text = self._ocr_image(image_data, page_num=i + 1)
-                all_text.append(f"--- Page {i+1} ---\n{page_text}")
+                all_text.append(f"--- Page {i + 1} ---\n{page_text}")
 
             combined = "\n".join(all_text)
             logger.info(f"OCR extracted {len(combined)} characters total")
@@ -108,11 +133,9 @@ class PDFProcessor:
             logger.error(f"OCR pipeline failed: {e}")
             return ""
 
-    def _log_ocr_start(self, file_path: Path):
-        logger.info(f"Starting OCR pipeline for: {file_path.name}")
-
     def _convert_pdf_to_images(self, pdf_path: str) -> list[bytes]:
-        """Convert PDF pages to PNG images using pdf2image."""
+        """Convert PDF pages to PNG images."""
+        # Try pdf2image first
         try:
             from pdf2image import convert_from_path
             pages = convert_from_path(pdf_path, dpi=150, fmt="png")
@@ -121,23 +144,24 @@ class PDFProcessor:
                 buf = io.BytesIO()
                 page.save(buf, format="PNG")
                 images.append(buf.getvalue())
-            logger.info(f"Converted {len(images)} PDF pages to images")
+            logger.info(f"pdf2image converted {len(images)} pages")
             return images
         except ImportError:
-            logger.warning("pdf2image not available, trying PyMuPDF fallback")
-            return self._convert_pdf_via_pymupdf(pdf_path)
+            logger.warning("pdf2image not available, trying PyMuPDF")
         except Exception as e:
-            logger.error(f"PDF to image conversion failed: {e}")
-            return []
+            logger.warning(f"pdf2image failed: {e}, trying PyMuPDF")
+
+        # Fallback to PyMuPDF
+        return self._convert_pdf_via_pymupdf(pdf_path)
 
     def _convert_pdf_via_pymupdf(self, pdf_path: str) -> list[bytes]:
-        """Fallback: convert PDF to images using PyMuPDF (fitz)."""
+        """Fallback: convert PDF to images using PyMuPDF."""
         try:
             import fitz  # PyMuPDF
             doc = fitz.open(pdf_path)
             images = []
             for page in doc:
-                mat = fitz.Matrix(1.5, 1.5)  # 1.5x zoom
+                mat = fitz.Matrix(1.5, 1.5)
                 pix = page.get_pixmap(matrix=mat)
                 images.append(pix.tobytes("png"))
             logger.info(f"PyMuPDF converted {len(images)} pages")
@@ -147,14 +171,13 @@ class PDFProcessor:
             return []
 
     def _ocr_image(self, image_bytes: bytes, page_num: int) -> str:
-        """Send a page image to OpenAI's vision API for OCR."""
+        """Send a page image to Azure OpenAI Vision API for OCR."""
         try:
-            from openai import OpenAI
-            client = OpenAI(api_key=self.api_key)
+            client = self._get_azure_client()
             b64 = base64.b64encode(image_bytes).decode("utf-8")
 
             response = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=self.deployment,
                 max_tokens=2000,
                 messages=[
                     {
@@ -163,29 +186,39 @@ class PDFProcessor:
                             {
                                 "type": "text",
                                 "text": (
-                                    "You are an OCR system. Extract ALL text from this document page image. "
-                                    "Do not summarize or paraphrase. Preserve all headings, section numbers, "
-                                    "bullet points, and table content exactly as they appear. "
-                                    "Output only the extracted text with no commentary."
-                                )
+                                    "You are an OCR system. Extract ALL text from this document "
+                                    "page image. Do not summarize or paraphrase. Preserve all "
+                                    "headings, section numbers, bullet points, and table content "
+                                    "exactly as they appear. Output only the extracted text with "
+                                    "no commentary."
+                                ),
                             },
                             {
                                 "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{b64}"}
-                            }
-                        ]
+                                "image_url": {"url": f"data:image/png;base64,{b64}"},
+                            },
+                        ],
                     }
-                ]
+                ],
             )
             return response.choices[0].message.content or ""
+
         except Exception as e:
             logger.error(f"Vision OCR failed for page {page_num}: {e}")
             return f"[OCR failed for page {page_num}: {e}]"
 
-    def process_uploaded_file(self, file_bytes: bytes, filename: str, save_dir: str = "data/raw_documents") -> str:
+    # ─────────────────────────────────────────────
+    # Uploaded file handling
+    # ─────────────────────────────────────────────
+
+    def process_uploaded_file(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        save_dir: str = "data/raw_documents",
+    ) -> str:
         """
-        Process an uploaded file from the Streamlit UI.
-        Saves the file locally and returns the local path.
+        Save an uploaded file from the Streamlit UI and return its local path.
         """
         save_path = Path(save_dir)
         save_path.mkdir(parents=True, exist_ok=True)
