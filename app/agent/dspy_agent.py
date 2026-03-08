@@ -9,6 +9,7 @@ import os
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse, parse_qs
 
 import dspy
 
@@ -32,28 +33,82 @@ from app.workbook.excel_generator import ExcelGenerator
 logger = logging.getLogger(__name__)
 
 
+def parse_azure_uri(full_uri: str) -> dict[str, str]:
+    """
+    Parse a full Azure OpenAI URI into its components.
+
+    Example input:
+        https://xyz.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2025-02-02-preview
+
+    Returns:
+        {
+            "base_url":    "https://xyz.openai.azure.com",
+            "deployment":  "gpt-4o",
+            "api_version": "2025-02-02-preview"
+        }
+    """
+    full_uri = full_uri.strip()
+    if not full_uri.startswith("http"):
+        full_uri = "https://" + full_uri
+
+    parsed = urlparse(full_uri)
+
+    # Base URL is just scheme + host
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+    # Deployment name sits between /deployments/ and /chat
+    deployment = "gpt-4o"  # fallback
+    if "/deployments/" in parsed.path:
+        deployment = parsed.path.split("/deployments/")[1].split("/")[0]
+
+    # api-version comes from query string
+    api_version = parse_qs(parsed.query).get("api-version", ["2025-02-02-preview"])[0]
+
+    return {
+        "base_url": base_url,
+        "deployment": deployment,
+        "api_version": api_version,
+    }
+
+
 class RegulatoryAgent:
     """
     Main agent that orchestrates the full regulatory compliance analysis workflow.
     Uses DSPy modules for LLM reasoning and reflection for self-improvement.
     """
 
-    def __init__(self, api_key: str, log_callback: Optional[Callable[[str], None]] = None):
+    def __init__(
+        self,
+        api_key: str,
+        full_uri: str,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ):
         """
-        Initialize the agent with an OpenAI API key.
+        Initialize the agent.
 
         Args:
-            api_key: OpenAI API key
+            api_key:      Azure OpenAI API key
+            full_uri:     Full Azure deployment URI including api-version query param
+                          e.g. https://xyz.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2025-02-02-preview
             log_callback: Optional callback for streaming logs to the UI
         """
         self.api_key = api_key
+        self.full_uri = full_uri
         self.log_callback = log_callback or (lambda msg: None)
         self.session_id = str(uuid.uuid4())[:8]
 
-        # Configure DSPy LLM
-        self._configure_dspy(api_key)
+        # Parse URI once — reused by DSPy and PDF processor
+        self.azure = parse_azure_uri(full_uri)
+        logger.info(
+            f"Azure config — base: {self.azure['base_url']} | "
+            f"deployment: {self.azure['deployment']} | "
+            f"api_version: {self.azure['api_version']}"
+        )
 
-        # Initialize all modules
+        # Configure DSPy LLM
+        self._configure_dspy()
+
+        # DSPy modules
         self.framework_identifier = FrameworkIdentifier()
         self.url_retriever = DocumentURLRetriever()
         self.doc_parser = DocumentStructureParser()
@@ -62,15 +117,15 @@ class RegulatoryAgent:
         self.qa_engine = ComplianceQAEngine()
         self.reflector = ExtractionQualityReflector(max_retries=2)
 
-        # Initialize tools
+        # Tools
         self.searcher = DuckDuckGoSearcher()
         self.downloader = DocumentDownloader()
-        self.pdf_processor = PDFProcessor(api_key=api_key)
+        self.pdf_processor = PDFProcessor(api_key=api_key, azure=self.azure)
         self.embedding_store = EmbeddingStore()
         self.topic_modeler = TopicModeler()
         self.excel_generator = ExcelGenerator()
 
-        # Memory and reflection
+        # Memory
         self.memory = AgentMemory()
         self.reflection_logger = ReflectionLogger()
 
@@ -81,48 +136,63 @@ class RegulatoryAgent:
         self.current_controls: list[dict] = []
         self.current_topics: list[dict] = []
 
-    def _configure_dspy(self, api_key: str):
-        """Configure DSPy with OpenAI."""
-        os.environ["OPENAI_API_KEY"] = api_key
-        lm = dspy.LM(model="openai/gpt-4o-mini", api_key=api_key, max_tokens=4000)
+    # ─────────────────────────────────────────────
+    # DSPy Configuration
+    # ─────────────────────────────────────────────
+
+    def _configure_dspy(self):
+        """Configure DSPy to use Azure OpenAI."""
+        os.environ["AZURE_OPENAI_API_KEY"] = self.api_key
+        os.environ["AZURE_OPENAI_ENDPOINT"] = self.azure["base_url"]
+        os.environ["AZURE_API_VERSION"] = self.azure["api_version"]
+
+        lm = dspy.LM(
+            model=f"azure/{self.azure['deployment']}",
+            api_key=self.api_key,
+            api_base=self.azure["base_url"],
+            api_version=self.azure["api_version"],
+            max_tokens=8000,
+        )
         dspy.configure(lm=lm)
-        logger.info("DSPy configured with GPT-4o-mini")
+        logger.info(
+            f"DSPy configured: azure/{self.azure['deployment']} "
+            f"@ {self.azure['base_url']} v{self.azure['api_version']}"
+        )
 
     def _log(self, message: str, level: str = "INFO"):
         """Log to both Python logger and UI callback."""
-        if level == "INFO":
-            logger.info(message)
-        elif level == "WARNING":
-            logger.warning(message)
-        elif level == "ERROR":
-            logger.error(message)
+        getattr(logger, level.lower(), logger.info)(message)
         self.log_callback(message)
+
+    def _safe_str(self, value: Any, default: str = "") -> str:
+        """Ensure a value is always a string, never None."""
+        if value is None:
+            return default
+        return str(value)
 
     # ─────────────────────────────────────────────
     # STEP 1: Framework Discovery
     # ─────────────────────────────────────────────
 
     def identify_frameworks(self, industry: str) -> list[dict]:
-        """
-        Step 1: Identify regulatory frameworks for a given industry.
-        Uses web search + LLM reasoning.
-        """
+        """Step 1: Identify regulatory frameworks for a given industry."""
         self._log(f"🔍 Searching for regulatory frameworks applicable to: {industry}")
         self.current_industry = industry
 
-        # Web search for context
         self._log("📡 Querying DuckDuckGo for regulatory landscape...")
         search_query = f"regulatory compliance frameworks standards {industry} industry requirements 2024"
         search_results = self.searcher.search(search_query, max_results=8)
         search_text = self._format_search_results(search_results)
 
-        # LLM identification
         self._log("🧠 Analyzing search results with DSPy FrameworkIdentifier...")
-        result = self.framework_identifier(industry=industry, search_results=search_text)
+        result = self.framework_identifier(
+            industry=self._safe_str(industry),
+            search_results=self._safe_str(search_text),
+        )
         frameworks = result.get("frameworks", [])
 
         if not frameworks:
-            self._log("⚠️  LLM returned no frameworks, using fallback search...", "WARNING")
+            self._log("⚠️  LLM returned no frameworks, using fallback...", "WARNING")
             frameworks = self._fallback_framework_search(industry)
 
         self.current_frameworks = frameworks
@@ -133,25 +203,49 @@ class RegulatoryAgent:
 
     def _fallback_framework_search(self, industry: str) -> list[dict]:
         """Fallback hardcoded frameworks for common industries."""
-        common_frameworks = {
+        common = {
             "fintech": [
-                {"name": "PCI-DSS", "year": 2004, "authority": "PCI Security Standards Council",
-                 "industries": ["Fintech", "Payments", "Banking"],
-                 "summary": "Payment Card Industry Data Security Standard protects cardholder data through technical and operational requirements. Applicable to all entities that store, process, or transmit payment card data. Version 4.0 released in 2022 with enhanced flexibility and continuous compliance focus. Mandatory for merchants and service providers handling card payments."},
-                {"name": "GDPR", "year": 2018, "authority": "European Union",
-                 "industries": ["Fintech", "All EU businesses"],
-                 "summary": "General Data Protection Regulation governs data privacy and protection for EU residents. Establishes rights for individuals and obligations for data controllers and processors. Imposes significant penalties for non-compliance up to 4% of global annual turnover. Applies to any organization processing EU resident data regardless of location."},
+                {
+                    "name": "PCI-DSS", "year": 2004,
+                    "authority": "PCI Security Standards Council",
+                    "industries": ["Fintech", "Payments", "Banking"],
+                    "summary": (
+                        "Payment Card Industry Data Security Standard protects cardholder data "
+                        "through technical and operational requirements. Applicable to all entities "
+                        "that store, process, or transmit payment card data. Version 4.0 released "
+                        "in 2022 with enhanced flexibility and continuous compliance focus."
+                    ),
+                },
+                {
+                    "name": "GDPR", "year": 2018,
+                    "authority": "European Union",
+                    "industries": ["Fintech", "All EU businesses"],
+                    "summary": (
+                        "General Data Protection Regulation governs data privacy and protection "
+                        "for EU residents. Imposes significant penalties for non-compliance up to "
+                        "4% of global annual turnover. Applies to any organization processing "
+                        "EU resident data regardless of location."
+                    ),
+                },
             ],
             "healthcare": [
-                {"name": "HIPAA", "year": 1996, "authority": "U.S. Department of Health & Human Services",
-                 "industries": ["Healthcare", "Health Insurance", "Health IT"],
-                 "summary": "Health Insurance Portability and Accountability Act protects patient health information privacy and security. Establishes standards for electronic health data transactions and code sets. The Security Rule requires administrative, physical, and technical safeguards. Covered entities and business associates must comply with all applicable provisions."},
+                {
+                    "name": "HIPAA", "year": 1996,
+                    "authority": "U.S. Department of Health & Human Services",
+                    "industries": ["Healthcare", "Health Insurance", "Health IT"],
+                    "summary": (
+                        "Health Insurance Portability and Accountability Act protects patient "
+                        "health information privacy and security. The Security Rule requires "
+                        "administrative, physical, and technical safeguards for all covered "
+                        "entities and business associates."
+                    ),
+                },
             ],
         }
-        return common_frameworks.get(industry.lower(), [])
+        return common.get(industry.lower(), [])
 
     def _format_search_results(self, results: list[dict]) -> str:
-        """Format search results into a text string for the LLM."""
+        """Format search results into text for the LLM."""
         if not results:
             return "No search results available."
         lines = []
@@ -167,26 +261,24 @@ class RegulatoryAgent:
     # ─────────────────────────────────────────────
 
     def retrieve_documents(self, framework_names: list[str]) -> dict[str, list[str]]:
-        """
-        Step 2: Find and download source documents for selected frameworks.
-        Returns dict mapping framework name to list of local file paths.
-        """
+        """Step 2: Find and download source documents for selected frameworks."""
         downloaded = {}
 
         for framework_name in framework_names:
             self._log(f"🌐 Searching for official documents: {framework_name}")
 
-            # Search for document URLs
             search_query = f"{framework_name} official PDF download compliance standard document"
             search_results = self.searcher.search(search_query, max_results=5)
             search_text = self._format_search_results(search_results)
 
-            # LLM extracts best URLs
-            urls = self.url_retriever(framework_name=framework_name, search_results=search_text)
+            urls = self.url_retriever(
+                framework_name=self._safe_str(framework_name),
+                search_results=self._safe_str(search_text),
+            )
             self._log(f"📎 Found {len(urls)} candidate URLs for {framework_name}")
 
             local_paths = []
-            for url in urls[:3]:  # Limit to top 3 URLs
+            for url in urls[:3]:
                 self._log(f"⬇️  Downloading: {url[:80]}...")
                 try:
                     local_path = self.downloader.download(url, framework_name)
@@ -205,13 +297,9 @@ class RegulatoryAgent:
     # ─────────────────────────────────────────────
 
     def process_document(self, file_path: str, framework_name: str) -> dict[str, Any]:
-        """
-        Step 3: Process a document file (PDF or HTML) into structured records.
-        Includes reflection loop for quality improvement.
-        """
+        """Step 3: Process a document file into structured records with reflection."""
         self._log(f"📄 Processing document: {Path(file_path).name}")
 
-        # Extract text
         self._log("🔤 Extracting text from document...")
         text = self.pdf_processor.extract_text(file_path)
 
@@ -221,12 +309,13 @@ class RegulatoryAgent:
 
         self._log(f"✅ Extracted {len(text)} characters of text")
 
-        # Parse document structure
         self._log("🏗️  Parsing document structure with DSPy...")
-        records = self.doc_parser(document_text=text, framework_name=framework_name)
+        records = self.doc_parser(
+            document_text=self._safe_str(text),
+            framework_name=self._safe_str(framework_name),
+        )
         self._log(f"📋 Initial extraction: {len(records)} requirement records")
 
-        # Reflection loop
         self._log("🔄 Running quality reflection loop...")
         reflection_result = self.reflector(original_text=text, extracted_records=records)
         records = reflection_result["records"]
@@ -244,7 +333,7 @@ class RegulatoryAgent:
         self.memory.record_extraction_quality(framework_name, quality_score, issues)
         self.memory.record_document_processed(framework_name, file_path, len(records))
 
-        self._log(f"✅ Extraction quality score: {quality_score}/10 | Records: {len(records)}")
+        self._log(f"✅ Quality score: {quality_score}/10 | Records: {len(records)}")
         self.current_records.extend(records)
 
         return {
@@ -259,9 +348,7 @@ class RegulatoryAgent:
     # ─────────────────────────────────────────────
 
     def run_topic_modeling(self, records: Optional[list[dict]] = None) -> list[dict]:
-        """
-        Step 4: Run BERTopic on document chunks to discover themes.
-        """
+        """Step 4: Run BERTopic on document chunks to discover themes."""
         records = records or self.current_records
         if not records:
             self._log("⚠️  No records to model topics on", "WARNING")
@@ -277,15 +364,12 @@ class RegulatoryAgent:
         topic_results = self.topic_modeler.fit(texts)
         self._log(f"✅ Discovered {len(topic_results['topic_keywords'])} topic clusters")
 
-        # Generate human-readable labels with LLM
         self._log("🏷️  Generating topic labels with DSPy...")
-        framework_context = self.current_industry
         labeled_topics = self.topic_generator(
             topic_keywords=topic_results["topic_keywords"],
-            framework_context=framework_context
+            framework_context=self._safe_str(self.current_industry),
         )
 
-        # Merge BERTopic results with LLM labels
         topics = self._merge_topic_results(topic_results, labeled_topics, records)
         self.current_topics = topics
         self._log(f"✅ Topic modeling complete: {len(topics)} labeled themes")
@@ -296,7 +380,7 @@ class RegulatoryAgent:
         self,
         topic_results: dict,
         labeled_topics: list[dict],
-        records: list[dict]
+        records: list[dict],
     ) -> list[dict]:
         """Merge BERTopic results with LLM-generated labels."""
         merged = []
@@ -304,7 +388,6 @@ class RegulatoryAgent:
 
         for topic_id, keywords in topic_results["topic_keywords"].items():
             label_data = label_map.get(topic_id, {})
-            # Find associated sections
             associated = [
                 r.get("section_number", "")
                 for r, tid in zip(records, topic_results.get("doc_topics", []))
@@ -329,11 +412,9 @@ class RegulatoryAgent:
         self,
         records: Optional[list[dict]] = None,
         topics: Optional[list[dict]] = None,
-        framework_name: str = "Multiple Frameworks"
+        framework_name: str = "Multiple Frameworks",
     ) -> list[dict]:
-        """
-        Step 5: Build a normalized compliance control library.
-        """
+        """Step 5: Build a normalized compliance control library."""
         records = records or self.current_records
         topics = topics or self.current_topics
 
@@ -341,7 +422,7 @@ class RegulatoryAgent:
         controls = self.control_builder(
             structured_records=records,
             topic_labels=topics,
-            framework_name=framework_name
+            framework_name=self._safe_str(framework_name),
         )
 
         self.current_controls = controls
@@ -360,12 +441,9 @@ class RegulatoryAgent:
         records: Optional[list[dict]] = None,
         controls: Optional[list[dict]] = None,
         topics: Optional[list[dict]] = None,
-        output_name: str = "compliance_workbook"
+        output_name: str = "compliance_workbook",
     ) -> str:
-        """
-        Step 6: Generate an Excel compliance workbook.
-        Returns the path to the generated file.
-        """
+        """Step 6: Generate an Excel compliance workbook."""
         frameworks = frameworks or self.current_frameworks
         records = records or self.current_records
         controls = controls or self.current_controls
@@ -406,7 +484,6 @@ class RegulatoryAgent:
         """Answer a compliance question using RAG."""
         self._log(f"❓ Processing question: {question[:80]}...")
 
-        # Retrieve relevant chunks
         chunks = self.embedding_store.search(question, k=6)
         if not chunks:
             self._log("⚠️  No relevant documents found in index", "WARNING")
@@ -422,7 +499,10 @@ class RegulatoryAgent:
             context = "\n\n".join(context_parts)
 
         self._log("🧠 Generating answer with DSPy ComplianceQAEngine...")
-        answer = self.qa_engine(question=question, retrieved_context=context)
+        answer = self.qa_engine(
+            question=self._safe_str(question),
+            retrieved_context=self._safe_str(context),
+        )
         self._log("✅ Answer generated")
         return answer
 
@@ -435,28 +515,19 @@ class RegulatoryAgent:
         industry: str,
         framework_names: Optional[list[str]] = None,
     ) -> dict[str, Any]:
-        """
-        Run the complete analysis workflow end-to-end.
-        """
+        """Run the complete analysis workflow end-to-end."""
         self._log(f"🚀 Starting full analysis for: {industry}")
         self._log("=" * 60)
 
-        # Step 1: Identify frameworks
         frameworks = self.identify_frameworks(industry)
         if framework_names:
             frameworks = [f for f in frameworks if f["name"] in framework_names]
 
-        # Step 2: Retrieve documents
-        if frameworks:
-            framework_list = [f["name"] for f in frameworks[:3]]  # Top 3 frameworks
-            downloaded = self.retrieve_documents(framework_list)
-        else:
-            downloaded = {}
+        downloaded = self.retrieve_documents([f["name"] for f in frameworks[:3]]) if frameworks else {}
 
-        # Step 3: Process documents
         all_records = []
         for framework_name, paths in downloaded.items():
-            for path in paths[:2]:  # Process up to 2 docs per framework
+            for path in paths[:2]:
                 try:
                     result = self.process_document(path, framework_name)
                     all_records.extend(result["records"])
@@ -464,40 +535,28 @@ class RegulatoryAgent:
                     self._log(f"⚠️  Error processing {path}: {e}", "WARNING")
 
         self.current_records = all_records
+        topics = self.run_topic_modeling(all_records) if all_records else []
+        controls = self.build_control_library(all_records, topics, industry) if all_records else []
 
-        # Step 4: Topic modeling
-        if all_records:
-            topics = self.run_topic_modeling(all_records)
-        else:
-            topics = []
-
-        # Step 5: Control library
-        if all_records:
-            controls = self.build_control_library(all_records, topics, industry)
-        else:
-            controls = []
-
-        # Step 6: Index for RAG
         if all_records:
             self.index_documents(all_records)
 
-        # Step 7: Generate workbook
         workbook_path = self.generate_workbook(
             frameworks=frameworks,
             records=all_records,
             controls=controls,
             topics=topics,
-            output_name=f"{industry.lower().replace(' ', '_')}_compliance"
+            output_name=f"{industry.lower().replace(' ', '_')}_compliance",
         )
 
         self._log("=" * 60)
         self._log("🎉 Full analysis complete!")
-        self._log(f"   Frameworks identified: {len(frameworks)}")
-        self._log(f"   Documents processed:   {len(downloaded)}")
+        self._log(f"   Frameworks identified:  {len(frameworks)}")
+        self._log(f"   Documents processed:    {len(downloaded)}")
         self._log(f"   Requirements extracted: {len(all_records)}")
-        self._log(f"   Topics discovered:     {len(topics)}")
-        self._log(f"   Controls generated:    {len(controls)}")
-        self._log(f"   Workbook:              {workbook_path}")
+        self._log(f"   Topics discovered:      {len(topics)}")
+        self._log(f"   Controls generated:     {len(controls)}")
+        self._log(f"   Workbook:               {workbook_path}")
 
         return {
             "frameworks": frameworks,
