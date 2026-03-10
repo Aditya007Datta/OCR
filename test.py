@@ -1,11 +1,9 @@
 # ------------------------------------------------------------
 # Requirements
 # pip install ddgs requests llama-index llama-index-readers-web llama-index-readers-file openai
-# Ensure wget installed (winget install GnuWin32.Wget)
 # ------------------------------------------------------------
 
 import os
-import subprocess
 import requests
 from pathlib import Path
 from ddgs import DDGS
@@ -67,7 +65,7 @@ def generate_queries(standard):
 
 
 # ------------------------------------------------------------
-# SEARCH
+# SEARCH WEB
 # ------------------------------------------------------------
 
 def search_web(query, max_results=10):
@@ -88,37 +86,84 @@ def search_web(query, max_results=10):
 
 
 # ------------------------------------------------------------
-# LLM SELECTS CANONICAL DOCUMENT
+# DOWNLOAD USING REQUESTS
 # ------------------------------------------------------------
 
-def choose_best_document(standard, candidates):
+def download_file(url):
 
-    formatted = "\n".join([
-        f"{i+1}. {c['title']} | {c['url']} | {c['snippet']}"
-        for i, c in enumerate(candidates)
-    ])
+    filename = url.split("/")[-1]
+
+    if not filename or "." not in filename:
+        filename = "document.html"
+
+    filepath = DOWNLOAD_DIR / filename
+
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+
+    with open(filepath, "wb") as f:
+        f.write(r.content)
+
+    return filepath
+
+
+# ------------------------------------------------------------
+# PREVIEW EXTRACTION FOR LLM ANALYSIS
+# ------------------------------------------------------------
+
+def get_preview(url, size=5000):
+
+    try:
+        r = requests.get(url, timeout=10)
+
+        content = r.content[:size]
+
+        return content.decode("utf-8", errors="ignore")
+
+    except:
+        return ""
+
+
+# ------------------------------------------------------------
+# LLM CHOOSES CANONICAL DOCUMENT
+# ------------------------------------------------------------
+
+def choose_document_llm(standard, candidates):
+
+    previews = []
+
+    for c in candidates[:6]:
+
+        preview = get_preview(c["url"])
+
+        previews.append({
+            "url": c["url"],
+            "title": c["title"],
+            "preview": preview[:800]
+        })
 
     prompt = f"""
-Select the URL that is the official primary document for the standard.
+You must identify the official primary document for the following standard.
 
 Standard: {standard}
 
 Ignore:
 - quick start guides
+- implementation guides
+- vendor documents
 - mappings
-- vendor whitepapers
-- summaries
+- blog posts
 
-Return ONLY the URL.
+Return ONLY the URL that corresponds to the primary framework or specification.
 
 Candidates:
-{formatted}
+{previews}
 """
 
     response = client.chat.completions.create(
         model=AZURE_DEPLOYMENT,
         messages=[
-            {"role": "system", "content": "Identify official standards documents."},
+            {"role": "system", "content": "You identify canonical standards documents."},
             {"role": "user", "content": prompt}
         ],
         temperature=0
@@ -134,46 +179,20 @@ Candidates:
 
 
 # ------------------------------------------------------------
-# DOWNLOAD WITH WGET
+# LLAMAINDEX DOCUMENT LOADER
 # ------------------------------------------------------------
 
-def wget_download(url):
+def load_document(url, local_file):
 
-    filename = url.split("/")[-1]
-
-    if not filename:
-        filename = "document.html"
-
-    filepath = DOWNLOAD_DIR / filename
-
-    subprocess.run([
-        "wget",
-        "--timeout=30",
-        "--tries=3",
-        "--user-agent=Mozilla/5.0",
-        "-O",
-        str(filepath),
-        url
-    ], check=True)
-
-    return filepath
-
-
-# ------------------------------------------------------------
-# LOAD WITH LLAMAINDEX
-# ------------------------------------------------------------
-
-def load_document(url, local_path=None):
-
-    # If PDF downloaded locally
-    if local_path and local_path.suffix == ".pdf":
+    # Handle PDF
+    if local_file.suffix.lower() == ".pdf":
 
         reader = PDFReader()
-        docs = reader.load_data(file=local_path)
+        docs = reader.load_data(file=local_file)
 
         return docs
 
-    # HTML page
+    # Handle HTML page
     reader = SimpleWebPageReader(html_to_text=True)
     docs = reader.load_data(urls=[url])
 
@@ -198,7 +217,7 @@ def fetch_standard_document(standard):
 
         candidates.extend(results)
 
-    # remove duplicates
+    # deduplicate
     seen = set()
     unique = []
 
@@ -209,24 +228,22 @@ def fetch_standard_document(standard):
 
     unique = unique[:15]
 
-    print("\nCandidates:")
+    print("\nCandidate URLs:")
     for c in unique:
         print(c["url"])
 
-    best_url = choose_best_document(standard, unique)
+    best_url = choose_document_llm(standard, unique)
 
     if not best_url:
         print("\nNo canonical document identified.")
         return None
 
-    print("\nSelected:", best_url)
+    print("\nSelected document:", best_url)
 
-    # Download document using wget
-    local_file = wget_download(best_url)
+    local_file = download_file(best_url)
 
-    print("\nDownloaded to:", local_file)
+    print("\nDownloaded:", local_file)
 
-    # Load using LlamaIndex
     docs = load_document(best_url, local_file)
 
     print("\nLoaded documents:", len(docs))
@@ -245,6 +262,6 @@ if __name__ == "__main__":
     documents = fetch_standard_document(standard)
 
     if documents:
-        print("\nDocument ready for indexing or RAG.")
+        print("\nDocument ready for processing.")
     else:
-        print("\nFailed.")
+        print("\nFailed to retrieve document.")
