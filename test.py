@@ -1,19 +1,19 @@
 # ------------------------------------------------------------
 # Requirements
 # pip install ddgs requests llama-index llama-index-readers-web llama-index-readers-file openai
+# Ensure wget installed (winget install GnuWin32.Wget)
 # ------------------------------------------------------------
 
 import os
+import subprocess
+import requests
 from pathlib import Path
 from ddgs import DDGS
-
-# Azure OpenAI
 from openai import AzureOpenAI
 
-# LlamaIndex Readers
+# LlamaIndex readers
 from llama_index.readers.web import SimpleWebPageReader
 from llama_index.readers.file import PDFReader
-from llama_index.core import Document
 
 
 # ------------------------------------------------------------
@@ -33,7 +33,7 @@ client = AzureOpenAI(
 
 
 # ------------------------------------------------------------
-# CONFIGURATION
+# CONFIG
 # ------------------------------------------------------------
 
 DOWNLOAD_DIR = Path("downloads")
@@ -50,7 +50,7 @@ QUERY_TEMPLATES = [
 
 
 # ------------------------------------------------------------
-# GENERATE SEARCH QUERIES
+# QUERY GENERATION
 # ------------------------------------------------------------
 
 def generate_queries(standard):
@@ -67,7 +67,7 @@ def generate_queries(standard):
 
 
 # ------------------------------------------------------------
-# SEARCH ENGINE
+# SEARCH
 # ------------------------------------------------------------
 
 def search_web(query, max_results=10):
@@ -88,7 +88,7 @@ def search_web(query, max_results=10):
 
 
 # ------------------------------------------------------------
-# LLM SELECTION
+# LLM SELECTS CANONICAL DOCUMENT
 # ------------------------------------------------------------
 
 def choose_best_document(standard, candidates):
@@ -99,14 +99,15 @@ def choose_best_document(standard, candidates):
     ])
 
     prompt = f"""
-You are helping identify the official canonical document for a standard.
+Select the URL that is the official primary document for the standard.
 
 Standard: {standard}
 
-Select the ONE URL that most likely represents the PRIMARY specification
-or official framework document.
-
-Ignore guides, vendor summaries, mappings, or reference materials.
+Ignore:
+- quick start guides
+- mappings
+- vendor whitepapers
+- summaries
 
 Return ONLY the URL.
 
@@ -117,7 +118,7 @@ Candidates:
     response = client.chat.completions.create(
         model=AZURE_DEPLOYMENT,
         messages=[
-            {"role": "system", "content": "Identify canonical standards documents."},
+            {"role": "system", "content": "Identify official standards documents."},
             {"role": "user", "content": prompt}
         ],
         temperature=0
@@ -133,35 +134,50 @@ Candidates:
 
 
 # ------------------------------------------------------------
-# LLAMAINDEX DOCUMENT LOADING
+# DOWNLOAD WITH WGET
 # ------------------------------------------------------------
 
-def load_document(url):
+def wget_download(url):
 
-    # PDF handling
-    if url.lower().endswith(".pdf"):
+    filename = url.split("/")[-1]
 
-        pdf_path = DOWNLOAD_DIR / url.split("/")[-1]
+    if not filename:
+        filename = "document.html"
 
-        import requests
-        r = requests.get(url)
+    filepath = DOWNLOAD_DIR / filename
 
-        with open(pdf_path, "wb") as f:
-            f.write(r.content)
+    subprocess.run([
+        "wget",
+        "--timeout=30",
+        "--tries=3",
+        "--user-agent=Mozilla/5.0",
+        "-O",
+        str(filepath),
+        url
+    ], check=True)
+
+    return filepath
+
+
+# ------------------------------------------------------------
+# LOAD WITH LLAMAINDEX
+# ------------------------------------------------------------
+
+def load_document(url, local_path=None):
+
+    # If PDF downloaded locally
+    if local_path and local_path.suffix == ".pdf":
 
         reader = PDFReader()
-        docs = reader.load_data(file=pdf_path)
+        docs = reader.load_data(file=local_path)
 
         return docs
 
-    # HTML / webpage handling
-    else:
+    # HTML page
+    reader = SimpleWebPageReader(html_to_text=True)
+    docs = reader.load_data(urls=[url])
 
-        reader = SimpleWebPageReader(html_to_text=True)
-
-        docs = reader.load_data(urls=[url])
-
-        return docs
+    return docs
 
 
 # ------------------------------------------------------------
@@ -182,7 +198,7 @@ def fetch_standard_document(standard):
 
         candidates.extend(results)
 
-    # deduplicate
+    # remove duplicates
     seen = set()
     unique = []
 
@@ -191,7 +207,6 @@ def fetch_standard_document(standard):
             seen.add(c["url"])
             unique.append(c)
 
-    # limit pool
     unique = unique[:15]
 
     print("\nCandidates:")
@@ -206,7 +221,13 @@ def fetch_standard_document(standard):
 
     print("\nSelected:", best_url)
 
-    docs = load_document(best_url)
+    # Download document using wget
+    local_file = wget_download(best_url)
+
+    print("\nDownloaded to:", local_file)
+
+    # Load using LlamaIndex
+    docs = load_document(best_url, local_file)
 
     print("\nLoaded documents:", len(docs))
 
@@ -224,6 +245,6 @@ if __name__ == "__main__":
     documents = fetch_standard_document(standard)
 
     if documents:
-        print("\nDocument successfully loaded.")
+        print("\nDocument ready for indexing or RAG.")
     else:
         print("\nFailed.")
